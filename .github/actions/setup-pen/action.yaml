@@ -3,7 +3,7 @@ description: Sets up the Pen toolchain, LLVM, and PEN_ROOT for os-tape
 runs:
   using: composite
   steps:
-    - uses: raviqqe/enable-homebrew@6bd383659a321c332bd0c0ed445c32d54e04efe # v1.0.5
+    - uses: raviqqe/enable-homebrew@6bd383659a321c332bd0c0ed445c32d54e04efe8 # v1.0.5
       with:
         stable: true
     - run: brew install llvm@16
