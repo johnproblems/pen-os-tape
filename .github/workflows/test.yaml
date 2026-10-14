@@ -13,6 +13,7 @@ concurrency:
 
 env:
   PEN_VERSION: 0.6.9
+  RUSTUP_AUTO_SELF_UPDATE: disable
 
 jobs:
   build:

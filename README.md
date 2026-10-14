@@ -2,17 +2,98 @@
 
 os-tape is a drop-in replacement for Pen's standard `os` system package. It
 records every effect a program performs into a tape file, then replays that
-tape without touching the disk, network, clock, or terminal. To use it,
-change one line in `pen.json`:
+tape without touching the disk, network, clock, or terminal. A crash seen
+once in production becomes a tape, and the tape becomes a regression test
+anyone can run offline.
 
-```json
-"Os": "git://github.com/<you>/os-tape"
+## CLI
+
+```sh
+os-tape record [--package DIR] [--tape TAPE] -- ./app [args...]
+os-tape replay [--diff] <tape> [-- ./app [args...]]
+os-tape check [tapes/]
+os-tape validate <tape>
+os-tape info <tape>
+os-tape cat <tape> --seq N
 ```
 
-The app source does not change: the compiler names the context field after
-the `pen.json` key, so the code still says `ctx.Os`. A crash seen once in
-production becomes a tape, and the tape becomes a regression test anyone can
-run offline.
+`os-tape --help` documents every command; `os-tape --version` prints the
+release. Each command is spelled out with examples in the Quickstart below.
+
+## Quickstart
+
+Prerequisites: `pen` 0.6.9, LLVM 16 (`llc`, `llvm-config`, ...), `turtle`, a
+Pen checkout exported as `PEN_ROOT`, Python 3.9+, and Rust (the FFI crates
+pin 1.99.0 via `rust-toolchain.toml`). CI installs all of these — see
+`.github/actions/setup-pen`.
+
+1. **Swap the dependency.** In your app's `pen.json`, point `Os` at os-tape.
+   No source change is needed: the compiler names the context field after
+   the `pen.json` key, so code keeps saying `ctx.Os`.
+
+```json
+{
+  "type": "application",
+  "dependencies": {
+    "Os": "git://github.com/johnproblems/pen-os-tape"
+  }
+}
+```
+
+2. **Build.**
+
+```sh
+pen build
+```
+
+3. **Record.** `record` rebuilds the package, then runs your app with
+   recording on:
+
+```sh
+os-tape record --tape demo.tape -- ./app hello.txt
+```
+
+   Without `--tape`, the tape goes to `tapes/<app>-<stamp>.tape`;
+   `--package DIR` builds a package in another directory. The equivalent
+   direct form is `PEN_TAPE=record:demo.tape ./app hello.txt`.
+
+4. **Replay.** Delete the inputs, stop the servers — the tape has everything:
+
+```sh
+os-tape replay demo.tape
+```
+
+   The app defaults to the recorded argv; override it with
+   `os-tape replay demo.tape -- ./app other-args`. Direct form:
+   `PEN_TAPE=replay:demo.tape ./app hello.txt`.
+
+   Replay is strict: a call with no tape entry left stops the program with
+   the call, its arguments, and the closest tape entries. `Sleep` returns
+   immediately and `GetTime` serves the recorded value, so a 10 s sleep
+   replays in milliseconds.
+
+5. **Diff.** Change the code, rebuild, and compare its outputs to the tape:
+
+```sh
+os-tape replay --diff demo.tape
+```
+
+   Direct form: `PEN_TAPE=replay:demo.tape PEN_TAPE_OUTPUTS=diff ./app
+   hello.txt`. os-tape prints a unified diff of new-vs-recorded outputs
+   (stdout/stderr writes, file writes, sends, creates, removes) and exits
+   non-zero on any difference; unchanged code exits 0 silently.
+
+6. **Gate CI on tapes.** Commit the `tapes/` directory and check every tape:
+
+```sh
+os-tape check tapes/
+```
+
+   Prints one `PASS`/`FAIL` line per tape and exits non-zero if any differ.
+   Each tape names its own app, so no command is needed; an empty
+   directory prints "no tapes found" and exits 0. `record` warns when the
+   app uses system packages os-tape does not cover (`http`, `sql`,
+   `random`): those effects stay live during replay.
 
 ## Demos
 
@@ -31,45 +112,18 @@ regenerate them with `scripts/make-demos.sh` (needs the Pen toolchain,
 the sessions with `script(1)`, renders 12 s clips, and verifies duration and
 animation.
 
-## Modes
+## Environment variables
 
-Chosen at run time by `PEN_TAPE`; the same binary does all three:
+The same binary does all three modes; only the environment changes:
 
-| `PEN_TAPE`        | Behavior                                              |
-| ----------------- | ----------------------------------------------------- |
-| unset             | Behaves exactly like `os`                             |
-| `record:<file>`   | Runs live and writes a tape                           |
-| `replay:<file>`   | Serves every input from the tape                      |
-
-Replay is strict by default: any call not on the tape stops the program with
-a readable diff. With `PEN_TAPE_OUTPUTS=diff`, input calls are served from
-the tape while output calls (stdout/stderr writes, file writes, sends,
-creates, removes) are compared instead; os-tape prints a unified diff and
-exits non-zero if they differ. Replay is fast: `Sleep` returns immediately
-and `GetTime` returns the recorded value.
-
-## CLI
-
-```sh
-os-tape record [--tape TAPE] -- ./app args...  # build and run in record mode
-os-tape replay tape.tape             # replay one tape (app from the header)
-os-tape replay --diff tape.tape      # replay, comparing outputs
-os-tape check tapes/                 # replay every tape in diff mode (CI entry)
-os-tape validate tape.tape           # check the tape is well-formed
-os-tape info tape.tape               # calls, per-function counts, duration, blobs
-os-tape cat tape.tape --seq 41       # print entry 41, blobs resolved inline
-```
-
-`record` warns when the app depends on system packages os-tape does not
-cover (`http`, `sql`, `random`): those effects stay live during replay.
-`record` writes to `tapes/<app>-<stamp>.tape` unless `--tape` (or `-o`)
-names a path. `check` prints one `PASS`/`FAIL` line per tape and exits
-non-zero when any tape differs; an empty directory prints "no tapes found"
-and exits 0.
-
-Prerequisites: the `pen` command, LLVM 16 (`llc`, `opt`, `llvm-ar`,
-`llvm-config`), `turtle`, and `PEN_ROOT` pointing at a Pen checkout. CI
-installs all of these (`.github/actions/setup-pen`).
+| Variable             | Meaning                                                      |
+| -------------------- | ------------------------------------------------------------ |
+| `PEN_TAPE`           | Unset: behave exactly like `os`. `record:<file>`: run live  |
+|                      | and write a tape. `replay:<file>`: serve inputs from tape.   |
+| `PEN_TAPE_OUTPUTS`   | With `replay:<file>`: `diff` compares outputs instead of    |
+|                      | requiring an exact match.                                    |
+| `PEN_TAPE_MAX_BYTES` | Recording size cap for tape + blobs (default 512 MiB);       |
+|                      | accepts suffixes (`1M`); invalid values fail fast.           |
 
 ## Tape format
 
@@ -133,13 +187,15 @@ scripts/drift-check.sh                               # upstream drift + 32/32 wr
 
 ## Status and scope
 
-Phase 1 covers the `os` package only (`http`, `sql`, `random` later). Out of
-scope, as in the PRD: capturing child-process output of `RunCommand` (only
-its result is recorded), reproducing exact `go`/`race` thread interleavings,
-and tape editing tooling. See `prd.md` for the full plan. Open questions
-carried from the PRD: strict-per-key vs global replay order under `os-sync`,
-tapes beside `*.test.pen` with `pen test` integration, and a tape-aware
-`random` package for v1.
+0.1.0 covers the `os` package only. Out of scope, as in the PRD: the `http`,
+`sql`, and `random` system packages (later, same pattern); capturing
+child-process output of `RunCommand` (only its result is recorded);
+reproducing exact `go`/`race` thread interleavings; and tape editing
+tooling. See `prd.md` for the full plan and `IMPROVEMENTS.md` for the
+shipped follow-up backlog. Open questions carried from the PRD:
+strict-per-key vs global replay order under `os-sync`, tapes beside
+`*.test.pen` with `pen test` integration (needs an upstream runner change),
+and a tape-aware `random` package.
 
 ## License
 

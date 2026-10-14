@@ -657,6 +657,31 @@ class EnvDocsTests(unittest.TestCase):
         )
 
 
+class CISetupTests(unittest.TestCase):
+    """CI must pre-install Rust toolchains before any cargo runs.
+
+    Regression test: parallel rustc shims under one cargo build raced
+    rustup toolchain syncs on fresh runners (.partial rename failures),
+    and clippy was missing from the minimal toolchain install.
+    """
+
+    def test_setup_pen_preinstalls_toolchains_first(self):
+        action = (
+            REPO_ROOT / ".github" / "actions" / "setup-pen" / "action.yaml"
+        ).read_text()
+        self.assertIn("rustup toolchain install", action)
+        self.assertIn("clippy", action)
+        self.assertLess(
+            action.index("rustup toolchain install"),
+            action.index("cargo install"),
+            "toolchain pre-install must run before the first cargo invocation",
+        )
+
+    def test_workflow_disables_rustup_self_update(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text()
+        self.assertIn("RUSTUP_AUTO_SELF_UPDATE", workflow)
+
+
 class DriftTests(unittest.TestCase):
     def upstream_files(self):
         script = (REPO_ROOT / "scripts" / "drift-check.sh").read_text()
