@@ -683,6 +683,11 @@ class CISetupTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text()
         self.assertIn("RUSTUP_AUTO_SELF_UPDATE", workflow)
 
+    def test_tapes_job_serializes_cargo_builds(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text()
+        tapes = workflow.split("tapes:")[1].split("\n  drift:")[0]
+        self.assertIn("CARGO_BUILD_JOBS", tapes)
+
 
 class DriftTests(unittest.TestCase):
     def upstream_files(self):
