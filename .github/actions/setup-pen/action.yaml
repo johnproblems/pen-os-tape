@@ -7,16 +7,16 @@ runs:
         set -e
         PINNED="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
         [ -n "$PINNED" ] || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
-        # Install every toolchain serially, before any cargo runs: one cargo
-        # build fans out to parallel rustc shims, and concurrent rustup syncs
-        # race on the shared downloads dir (observed .partial rename
-        # failures). stable covers cargo runs outside this checkout.
-        rustup toolchain install --profile minimal --no-self-update stable "$PINNED"
+        # Fully sync every toolchain serially, before any cargo runs: one
+        # cargo build fans out to parallel rustc shims, and concurrent
+        # rustup syncs race on the shared downloads dir (observed .partial
+        # rename failures). `update` (not `install`) so pre-existing stale
+        # toolchains are synced too. stable covers cargo runs outside this
+        # checkout (pen stages file:// dependencies elsewhere).
+        rustup update --no-self-update stable "$PINNED"
         rustup component add --toolchain "$PINNED" clippy
       shell: bash
     - uses: raviqqe/enable-homebrew@6bd383659a321c332bd0c0ed445c32d54e04efe8 # v1.0.5
-      with:
-        stable: true
     - run: brew install llvm@16
       shell: bash
     - run: echo "PATH=$(brew --prefix)/opt/llvm@16/bin:$PATH" >>$GITHUB_ENV

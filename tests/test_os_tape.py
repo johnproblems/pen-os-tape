@@ -669,12 +669,14 @@ class CISetupTests(unittest.TestCase):
         action = (
             REPO_ROOT / ".github" / "actions" / "setup-pen" / "action.yaml"
         ).read_text()
-        self.assertIn("rustup toolchain install", action)
+        # `update`, not `install`: pre-existing stale toolchains must be
+        # synced too, or parallel rustc shims race the sync later.
+        self.assertIn("rustup update", action)
         self.assertIn("clippy", action)
         self.assertLess(
-            action.index("rustup toolchain install"),
+            action.index("rustup update"),
             action.index("cargo install"),
-            "toolchain pre-install must run before the first cargo invocation",
+            "toolchain pre-sync must run before the first cargo invocation",
         )
 
     def test_workflow_disables_rustup_self_update(self):
