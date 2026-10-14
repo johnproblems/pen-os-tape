@@ -1,0 +1,32 @@
+name: pen/setup-os-tape
+description: Sets up the Pen toolchain, LLVM, and PEN_ROOT for os-tape
+runs:
+  using: composite
+  steps:
+    - uses: raviqqe/enable-homebrew@6bd383659a321c332bd0c0ed445c32d54e04efe # v1.0.5
+      with:
+        stable: true
+    - run: brew install llvm@16
+      shell: bash
+    - run: echo "PATH=$(brew --prefix)/opt/llvm@16/bin:$PATH" >>$GITHUB_ENV
+      shell: bash
+    - run: cargo install turtle-build
+      shell: bash
+    - run: |
+        set -e
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64) asset="pen-$PEN_VERSION-x86_64-unknown-linux-gnu.tar.xz" ;;
+          macOS-ARM64) asset="pen-$PEN_VERSION-aarch64-apple-darwin.tar.xz" ;;
+          *) echo "unsupported platform" >&2; exit 1 ;;
+        esac
+        curl -sL --fail -o /tmp/pen.tar.xz \
+          "https://github.com/pen-lang/pen/releases/download/v$PEN_VERSION/$asset"
+        mkdir -p /tmp/pen-dist "$HOME/.local/bin"
+        tar -xf /tmp/pen.tar.xz -C /tmp/pen-dist target/release/pen
+        cp /tmp/pen-dist/target/release/pen "$HOME/.local/bin/pen"
+        echo "$HOME/.local/bin" >>$GITHUB_PATH
+      shell: bash
+    - run: git clone --depth 1 --branch "v$PEN_VERSION" https://github.com/pen-lang/pen /tmp/pen-root
+      shell: bash
+    - run: echo "PEN_ROOT=/tmp/pen-root" >>$GITHUB_ENV
+      shell: bash

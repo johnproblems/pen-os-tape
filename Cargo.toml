@@ -1,0 +1,11 @@
+# Workspace root for the two Rust crates of os-tape. The FFI library keeps its
+# historical artifact name (libos.a) via [lib] name; see ffi/library/Cargo.toml
+# and pen-ffi.sh. Run the FFI tests from here with:
+#
+#   RUSTFLAGS="-D warnings" cargo test -p os-tape-ffi
+[workspace]
+resolver = "3"
+members = [
+  "ffi/library",
+  "ffi/application",
+]

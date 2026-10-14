@@ -1,0 +1,11 @@
+import 'Context'context { Context }
+
+# Get command line arguments.
+Arguments = \(ctx Context) [string] {
+  context'Inner(ctx).GetArguments()
+}
+
+# Get an environment variable.
+Variable = \(ctx Context, name string) string | error {
+  context'Inner(ctx).GetEnvironmentVariable(name)
+}

@@ -1,0 +1,9 @@
+.pen/
+target/
+ffi/library/target/
+ffi/application/target/
+tapes/*.tape
+tapes/blobs/
+__pycache__/
+*.pyc
+.DS_Store

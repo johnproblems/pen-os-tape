@@ -1,0 +1,16 @@
+import 'Context'context { Context }
+
+# Read a directory and return file paths it contains.
+Read = \(ctx Context, path string) [string] | error {
+  context'Inner(ctx).ReadDirectory(path)
+}
+
+# Create a directory.
+Create = \(ctx Context, path string) none | error {
+  context'Inner(ctx).CreateDirectory(path)
+}
+
+# Remove a directory.
+Remove = \(ctx Context, path string) none | error {
+  context'Inner(ctx).RemoveDirectory(path)
+}

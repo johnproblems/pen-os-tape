@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""os-tape: record a real run, replay it exactly.
+
+Commands:
+  record    build the app package and run it in record mode
+  replay    replay one tape
+  check     replay every tape in a folder in diff mode (CI entry point)
+  validate  check a tape is well-formed and its blobs are present
+  info      summarize a tape (calls, per-function counts, duration, blobs)
+  cat       print one tape entry, resolving blob references inline
+"""
+
+import base64
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+# System packages os-tape does not interpose on. Apps using them still perform
+# those effects live during replay, so `record` warns about them.
+UNCOVERED_PACKAGES = ("http", "sql", "random")
+
+# The 32 wrapped foreign functions (without the `_pen_os_` prefix), mirrored
+# from the tape_fns! table in ffi/library/src/tape.rs. A unit test asserts the
+# two lists stay identical to Context/context.pen.
+KNOWN_FNS = frozenset(
+    {
+        "read_stdin",
+        "read_limit_stdin",
+        "write_stdout",
+        "write_stderr",
+        "open_file",
+        "read_file",
+        "read_limit_file",
+        "write_file",
+        "copy_file",
+        "move_file",
+        "remove_file",
+        "read_directory",
+        "create_directory",
+        "remove_directory",
+        "get_arguments",
+        "get_environment_variable",
+        "read_metadata",
+        "tcp_bind",
+        "tcp_connect",
+        "tcp_accept",
+        "tcp_receive",
+        "tcp_send",
+        "udp_bind",
+        "udp_connect",
+        "udp_receive",
+        "udp_receive_from",
+        "udp_send",
+        "udp_send_to",
+        "get_time",
+        "sleep",
+        "exit",
+        "run_command",
+    }
+)
+
+BLOB_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+VERSION_FALLBACK = "0.1.0"
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def version() -> str:
+    try:
+        text = (repo_root() / "ffi" / "library" / "Cargo.toml").read_text()
+    except OSError:
+        return VERSION_FALLBACK
+    for line in text.splitlines():
+        if line.strip().startswith("version"):
+            _, _, value = line.partition("=")
+            return value.strip().strip('"')
+    return VERSION_FALLBACK
+
+
+def die(message: str) -> "NoReturn":
+    print(f"os-tape: error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def fail(message: str) -> "NoReturn":
+    """Content failure (a bad tape, a missing entry): exit 1, not a usage error."""
+    print(f"os-tape: error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(message: str) -> None:
+    print(f"os-tape: warning: {message}", file=sys.stderr)
+
+
+def run(cmd, env=None, cwd=None):
+    return subprocess.run(cmd, env=env, cwd=cwd)
+
+
+def read_pen_json(package_dir: Path) -> dict:
+    path = package_dir / "pen.json"
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        die(f"no pen.json in {package_dir}")
+    except json.JSONDecodeError as error:
+        die(f"cannot parse {path}: {error}")
+    raise AssertionError("unreachable")
+
+
+def check_uncovered_dependencies(package_dir: Path) -> None:
+    """Warn about system packages os-tape does not record."""
+    config = read_pen_json(package_dir)
+    deps = config.get("dependencies", {})
+    if not isinstance(deps, dict):
+        return
+    uncovered = sorted(
+        key
+        for key, value in deps.items()
+        if key.lower() in UNCOVERED_PACKAGES
+        or any(name in str(value).lower() for name in UNCOVERED_PACKAGES)
+    )
+    if uncovered:
+        warn(
+            f"package {package_dir} uses system packages os-tape does not cover "
+            f"({', '.join(uncovered)}); those effects stay live during replay"
+        )
+
+
+def split_command(argv: list) -> tuple:
+    """Split [os-tape args...] -- [app args...]."""
+    if "--" in argv:
+        index = argv.index("--")
+        return argv[:index], argv[index + 1 :]
+    return argv, []
+
+
+def parse_options(argv: list, flags: dict) -> tuple:
+    """Parse `--key value` / `--key=value` options; returns (opts, rest)."""
+    opts: dict = {}
+    rest: list = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--") and arg != "--":
+            key, sep, inline = arg[2:].partition("=")
+            if key not in flags:
+                die(f"unknown option --{key}")
+            if flags[key]:
+                if sep:
+                    opts[key] = inline
+                else:
+                    i += 1
+                    if i >= len(argv):
+                        die(f"--{key} needs a value")
+                    opts[key] = argv[i]
+            else:
+                if sep:
+                    die(f"--{key} takes no value")
+                opts[key] = True
+        elif arg.startswith("-") and arg != "-" and len(arg) == 2:
+            key = arg[1]
+            if key not in flags:
+                die(f"unknown option -{key}")
+            if flags[key]:
+                i += 1
+                if i >= len(argv):
+                    die(f"-{key} needs a value")
+                opts[key] = argv[i]
+            else:
+                opts[key] = True
+        else:
+            rest.append(arg)
+        i += 1
+    return opts, rest
+
+
+def default_tape_path(app: str) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    name = Path(app).stem or "app"
+    return Path("tapes") / f"{name}-{stamp}.tape"
+
+
+def cmd_record(argv: list) -> int:
+    own, command = split_command(argv)
+    opts, rest = parse_options(
+        own, {"o": True, "output": True, "tape": True, "package": True}
+    )
+    if rest:
+        die(
+            f"unexpected arguments before --: {' '.join(rest)} "
+            "(usage: os-tape record [--package DIR] [--tape TAPE] -- ./app [args...])"
+        )
+    if not command:
+        die("record needs an app command after --: os-tape record [--tape TAPE] -- ./app [args...]")
+    package_dir = Path(opts.get("package", "."))
+    check_uncovered_dependencies(package_dir)
+    print(f"os-tape: building {package_dir} ...", file=sys.stderr)
+    build = run(["pen", "build"], cwd=package_dir)
+    if build.returncode != 0:
+        die(f"pen build failed in {package_dir}")
+    tape = Path(
+        opts.get("tape")
+        or opts.get("output")
+        or opts.get("o")
+        or default_tape_path(command[0])
+    )
+    tape.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PEN_TAPE"] = f"record:{tape}"
+    env.pop("PEN_TAPE_OUTPUTS", None)
+    print(f"os-tape: recording {tape}", file=sys.stderr)
+    proc = run(command, env=env)
+    print(f"os-tape: wrote {tape} (exit {proc.returncode})", file=sys.stderr)
+    return proc.returncode
+
+
+def mode_context(tape: Path, mode=None) -> str:
+    """` [PEN_TAPE=<mode>:<tape>]` suffix so replay failures name the mode and
+    tape involved; empty when no mode applies (validate/info/cat)."""
+    if mode is None:
+        return ""
+    return f" [PEN_TAPE={mode}:{tape}]"
+
+
+def read_tape_header(tape: Path, mode=None) -> dict:
+    context = mode_context(tape, mode)
+    try:
+        with open(tape, encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError as error:
+        die(f"cannot read {tape}: {error}{context}")
+    try:
+        header = json.loads(first)
+    except json.JSONDecodeError:
+        die(f"{tape}: first line is not a tape header{context}")
+    if not isinstance(header, dict) or header.get("header") is not True:
+        die(f"{tape}: first line is not a tape header{context}")
+    return header
+
+
+def resolve_app(command: list, header: dict, tape=None, mode=None) -> list:
+    if command:
+        return command
+    argv = header.get("argv", [])
+    if not argv:
+        context = mode_context(tape, mode) if tape is not None else ""
+        die(f"tape header has no argv; pass the app after --{context}")
+    return list(argv)
+
+
+def cmd_replay(argv: list) -> int:
+    own, command = split_command(argv)
+    opts, rest = parse_options(own, {"diff": False, "outputs": True})
+    if len(rest) != 1:
+        die("replay needs exactly one tape\nusage: os-tape replay [--diff] <tape> [-- ./app args...]")
+    tape = Path(rest[0])
+    header = read_tape_header(tape, "replay")
+    app_command = resolve_app(command, header, tape, "replay")
+    env = dict(os.environ)
+    env["PEN_TAPE"] = f"replay:{tape}"
+    outputs = opts.get("outputs", "diff" if opts.get("diff") else None)
+    if outputs is not None:
+        env["PEN_TAPE_OUTPUTS"] = outputs
+    else:
+        env.pop("PEN_TAPE_OUTPUTS", None)
+    proc = run(app_command, env=env)
+    return proc.returncode
+
+
+def cmd_check(argv: list) -> int:
+    own, command = split_command(argv)
+    _opts, rest = parse_options(own, {})
+    if command:
+        die("check takes no app command; each tape names its own app")
+    if len(rest) > 1:
+        die("check takes at most one directory: os-tape check [tapes/]")
+    directory = Path(rest[0] if rest else "tapes")
+    if not directory.is_dir():
+        die(f"not a directory: {directory}")
+    tapes = sorted(directory.glob("*.tape"))
+    if not tapes:
+        print(f"os-tape: no tapes found in {directory}", file=sys.stderr)
+        return 0
+    failures = 0
+    for tape in tapes:
+        header = read_tape_header(tape, "replay")
+        app_command = resolve_app([], header, tape, "replay")
+        env = dict(os.environ)
+        env["PEN_TAPE"] = f"replay:{tape}"
+        env["PEN_TAPE_OUTPUTS"] = "diff"
+        print(f"os-tape: checking {tape} ...", file=sys.stderr)
+        proc = run(app_command, env=env)
+        if proc.returncode != 0:
+            print(f"FAIL {tape}")
+            failures += 1
+        else:
+            print(f"PASS {tape}")
+    if failures:
+        print(f"os-tape: {failures} of {len(tapes)} tapes differ", file=sys.stderr)
+        return 1
+    print(f"os-tape: all {len(tapes)} tapes match", file=sys.stderr)
+    return 0
+
+
+def blobs_dir_for(tape: Path) -> Path:
+    return tape.parent / "blobs"
+
+
+def find_blob_digests(value) -> list:
+    """Collect every {"blob": <digest>} digest under a JSON value."""
+    found = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "blob":
+                found.append(item)
+            else:
+                found.extend(find_blob_digests(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(find_blob_digests(item))
+    return found
+
+
+def load_tape(tape: Path) -> tuple:
+    """Parse a tape into (header, entries, footer).
+
+    entries is a list of (line_number, object). Blank lines are skipped, like
+    the replay engine skips them. Any malformed line fails naming its 1-based
+    line number.
+    """
+    try:
+        text = tape.read_text(encoding="utf-8")
+    except OSError as error:
+        fail(f"cannot read {tape}: {error}")
+    lines = text.split("\n")
+    if not lines or not lines[0].strip():
+        fail(f"{tape}: line 1: missing tape header")
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError as error:
+        fail(f"{tape}: line 1: invalid JSON: {error}")
+    if not isinstance(header, dict) or header.get("header") is not True:
+        fail(f"{tape}: line 1: not a tape header")
+    last = 1
+    for index, line in enumerate(lines, start=1):
+        if line.strip():
+            last = index
+    entries: list = []
+    footer = None
+    for lineno, line in enumerate(lines, start=1):
+        if lineno == 1 or not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError as error:
+            fail(f"{tape}: line {lineno}: invalid JSON: {error}")
+        if not isinstance(obj, dict):
+            fail(f"{tape}: line {lineno}: entry must be a JSON object")
+        if obj.get("footer") is True:
+            if footer is not None:
+                fail(f"{tape}: line {lineno}: duplicate footer")
+            if lineno != last:
+                fail(f"{tape}: line {lineno}: footer must be the last line")
+            footer = obj
+            continue
+        seq = obj.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            fail(f"{tape}: line {lineno}: entry needs an unsigned seq")
+        func = obj.get("fn")
+        if not isinstance(func, str):
+            fail(f"{tape}: line {lineno}: entry needs a fn name")
+        if func not in KNOWN_FNS:
+            fail(f"{tape}: line {lineno}: unknown function {func!r}")
+        if "args" not in obj:
+            fail(f"{tape}: line {lineno}: entry needs args")
+        has_ok, has_err = "ok" in obj, "err" in obj
+        if has_ok == has_err:
+            fail(f"{tape}: line {lineno}: entry needs exactly one of ok/err")
+        if has_err and not isinstance(obj["err"], str):
+            fail(f"{tape}: line {lineno}: err must be a string")
+        entries.append((lineno, obj))
+    return header, entries, footer
+
+
+def check_entry_blobs(tape: Path, entries: list) -> None:
+    """Fail naming any blob digest whose file is missing next to the tape."""
+    blobs = blobs_dir_for(tape)
+    for lineno, obj in entries:
+        digests = find_blob_digests(obj.get("args")) + find_blob_digests(obj.get("ok"))
+        for digest in digests:
+            if not isinstance(digest, str) or not BLOB_DIGEST_RE.match(digest):
+                fail(f"{tape}: line {lineno}: bad blob digest {digest!r}")
+            if not (blobs / digest).is_file():
+                fail(f"{tape}: line {lineno}: missing blob {digest} (no {blobs / digest})")
+
+
+def cmd_validate(argv: list) -> int:
+    own, command = split_command(argv)
+    if command:
+        die("validate takes no app command")
+    _opts, rest = parse_options(own, {})
+    if len(rest) != 1:
+        die("validate needs exactly one tape: os-tape validate <tape>")
+    tape = Path(rest[0])
+    _header, entries, _footer = load_tape(tape)
+    check_entry_blobs(tape, entries)
+    print(f"{tape}: valid ({len(entries)} calls)")
+    return 0
+
+
+def cmd_info(argv: list) -> int:
+    own, command = split_command(argv)
+    if command:
+        die("info takes no app command")
+    _opts, rest = parse_options(own, {})
+    if len(rest) != 1:
+        die("info needs exactly one tape: os-tape info <tape>")
+    tape = Path(rest[0])
+    header, entries, footer = load_tape(tape)
+    check_entry_blobs(tape, entries)
+    counts: dict = {}
+    for _lineno, obj in entries:
+        counts[obj["fn"]] = counts.get(obj["fn"], 0) + 1
+    start = header.get("start_time")
+    end = footer.get("end_time") if isinstance(footer, dict) else None
+    if (
+        isinstance(start, (int, float))
+        and not isinstance(start, bool)
+        and isinstance(end, (int, float))
+        and not isinstance(end, bool)
+        and end >= start
+    ):
+        duration = f"{(end - start) / 1000:.3f}s"
+    else:
+        duration = "unknown (no footer; interrupted or pre-footer recording?)"
+    blobs = blobs_dir_for(tape)
+    if blobs.is_dir():
+        files = [path for path in blobs.iterdir() if path.is_file()]
+        blob_bytes = sum(path.stat().st_size for path in files)
+        blob_line = f"{len(files)} files, {blob_bytes} bytes"
+    else:
+        blob_line = "0 files, 0 bytes"
+    recorded = header.get("os_tape", "unknown")
+    tape_version = header.get("v", "?")
+    print(f"tape: {tape}")
+    print(f"version: {recorded} (format v{tape_version})")
+    print(f"calls: {len(entries)}")
+    print("functions:")
+    for func in sorted(counts):
+        print(f"  {func}: {counts[func]}")
+    print(f"duration: {duration}")
+    print(f"blobs: {blob_line}")
+    return 0
+
+
+def resolve_inline(value, tape: Path, blobs: Path, lineno: int):
+    """Copy a JSON value with every {"blob": digest} replaced by its bytes."""
+    if isinstance(value, dict):
+        if "blob" in value:
+            digest = value["blob"]
+            if not isinstance(digest, str) or not BLOB_DIGEST_RE.match(digest):
+                fail(f"{tape}: line {lineno}: bad blob digest {digest!r}")
+            try:
+                data = (blobs / digest).read_bytes()
+            except OSError:
+                fail(f"{tape}: line {lineno}: missing blob {digest} (no {blobs / digest})")
+            try:
+                return {"t": data.decode("utf-8")}
+            except UnicodeDecodeError:
+                return {"b64": base64.b64encode(data).decode("ascii")}
+        return {key: resolve_inline(item, tape, blobs, lineno) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_inline(item, tape, blobs, lineno) for item in value]
+    return value
+
+
+def cmd_cat(argv: list) -> int:
+    own, command = split_command(argv)
+    if command:
+        die("cat takes no app command")
+    opts, rest = parse_options(own, {"seq": True})
+    if len(rest) != 1:
+        die("cat needs exactly one tape: os-tape cat <tape> --seq N")
+    if "seq" not in opts:
+        die("cat needs --seq N: os-tape cat <tape> --seq N")
+    try:
+        want = int(opts["seq"])
+    except ValueError:
+        die(f"--seq needs an integer, got {opts['seq']!r}")
+    tape = Path(rest[0])
+    _header, entries, _footer = load_tape(tape)
+    for lineno, obj in entries:
+        if obj["seq"] == want:
+            blobs = blobs_dir_for(tape)
+            resolved = {
+                key: resolve_inline(obj[key], tape, blobs, lineno)
+                for key in ("args", "ok", "err")
+                if key in obj
+            }
+            print(json.dumps({"seq": want, "fn": obj["fn"], **resolved}))
+            return 0
+    fail(f"{tape}: no entry with seq {want}")
+    raise AssertionError("unreachable")
+
+
+def print_help() -> None:
+    print(
+        f"""os-tape {version()}: record a real run, replay it exactly
+
+Usage:
+  os-tape record [--package DIR] [--tape TAPE] -- ./app [args...]
+      Build the package in DIR (default: .) and run the app in record mode,
+      writing the tape to TAPE (default: tapes/<app>-<stamp>.tape).
+      -o and --output are aliases of --tape.
+  os-tape replay [--diff] <tape> [-- ./app [args...]]
+      Replay one tape (default app: the recorded argv). --diff compares
+      outputs instead of requiring an exact match.
+  os-tape check [tapes/]
+      Replay every tape in the directory in diff mode; print one PASS/FAIL
+      line per tape and exit non-zero if any differ. This is the CI entry
+      point. An empty directory prints "no tapes found" and exits 0.
+  os-tape validate <tape>
+      Check the tape is well-formed and every blob reference has its file.
+  os-tape info <tape>
+      Print call count, per-function counts, record duration, blob bytes.
+  os-tape cat <tape> --seq N
+      Print entry N as JSON, resolving blob references inline.
+
+Modes are also selectable directly:
+  PEN_TAPE unset            behave exactly like os
+  PEN_TAPE=record:<file>    write a tape
+  PEN_TAPE=replay:<file>    serve every input from the tape
+  PEN_TAPE_OUTPUTS=diff     with replay: compare outputs, print a unified diff
+"""
+    )
+
+
+def main(argv: list) -> int:
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print_help()
+        return 0
+    if argv[1] in ("-V", "--version", "version"):
+        print(f"os-tape {version()}")
+        return 0
+    command, rest = argv[1], argv[2:]
+    if command == "record":
+        return cmd_record(rest)
+    if command == "replay":
+        return cmd_replay(rest)
+    if command == "check":
+        return cmd_check(rest)
+    if command == "validate":
+        return cmd_validate(rest)
+    if command == "info":
+        return cmd_info(rest)
+    if command == "cat":
+        return cmd_cat(rest)
+    die(f"unknown command {command} (want record, replay, check, validate, info, or cat)")
+    raise AssertionError("unreachable")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
