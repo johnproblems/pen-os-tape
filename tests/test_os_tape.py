@@ -683,10 +683,22 @@ class CISetupTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text()
         self.assertIn("RUSTUP_AUTO_SELF_UPDATE", workflow)
 
-    def test_tapes_job_serializes_cargo_builds(self):
-        workflow = (REPO_ROOT / ".github" / "workflows" / "test.yaml").read_text()
-        tapes = workflow.split("tapes:")[1].split("\n  drift:")[0]
-        self.assertIn("CARGO_BUILD_JOBS", tapes)
+    def test_setup_pen_preinstalls_ffi_targets(self):
+        action = (
+            REPO_ROOT / ".github" / "actions" / "setup-pen" / "action.yaml"
+        ).read_text()
+        # Every pen package's ffi/ dir pins cross targets and pen build runs
+        # those FFI builds concurrently; setup must pre-install the union
+        # serially so no build-time sync can race.
+        self.assertIn('"rustup", "target", "add"', action)
+
+    def test_ffi_toolchains_pin_no_cross_targets(self):
+        # os-tape's own FFI builds are native-only: demanding cross targets
+        # would force slow downloads (and sync races) in every consumer's
+        # build, as pen runs FFI builds concurrently.
+        for name in ("ffi/library/rust-toolchain.toml", "ffi/application/rust-toolchain.toml"):
+            text = (REPO_ROOT / name).read_text()
+            self.assertNotIn("targets", text, f"{name} must not pin targets")
 
 
 class DriftTests(unittest.TestCase):

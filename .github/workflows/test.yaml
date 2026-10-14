@@ -46,19 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-pen
-      - run: |
-          rustup toolchain list
-          rustup component list --toolchain stable --installed || true
-          ls ~/.rustup/toolchains/ || true
-          env | grep -i -E "rust|cargo" || true
-        shell: bash
       - run: python3 tests/e2e.py
-        env:
-          # One cargo fans out to parallel rustc shims; if any rustup sync
-          # is still needed at this point, concurrent shims race on the
-          # shared downloads dir (.partial rename failures). Serial builds
-          # are slower but cannot race.
-          CARGO_BUILD_JOBS: "1"
 
   drift:
     runs-on: ubuntu-latest

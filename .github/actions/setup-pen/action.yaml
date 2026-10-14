@@ -41,3 +41,46 @@ runs:
       shell: bash
     - run: echo "PEN_ROOT=/tmp/pen-root" >>$GITHUB_ENV
       shell: bash
+    - run: |
+        set -e
+        # Every pen system package's ffi/ dir pins its own rust-toolchain.toml
+        # with cross targets, and `pen build` runs those FFI builds
+        # concurrently. Pre-install the whole union serially so no toolchain
+        # sync - and no shared-downloads race - is left for build time.
+        # Unavailable targets (renamed wasi shims) are skipped: a later sync
+        # would skip them too.
+        python3 - <<'EOF'
+        import os
+        import re
+        import subprocess
+        from pathlib import Path
+        files = list(Path(".").glob("ffi/*/rust-toolchain.toml"))
+        pkgs = Path(os.environ.get("PEN_ROOT", "/tmp/pen-root"), "packages")
+        files += list(pkgs.glob("*/ffi/rust-toolchain.toml"))
+        files += list(pkgs.glob("*/ffi/*/rust-toolchain.toml"))
+        want = {}
+        for path in files:
+            text = path.read_text()
+            channel = re.search(r'^channel\s*=\s*"([^"]+)"', text, re.M)
+            if channel is None:
+                continue
+            targets = (
+                re.findall(r'"([a-z0-9_]+-[a-z0-9_-]+)"', text.split("targets", 1)[1])
+                if "targets" in text
+                else []
+            )
+            want.setdefault(channel.group(1), set()).update(targets)
+        for channel in sorted(want):
+            subprocess.run(
+                ["rustup", "toolchain", "install", "--profile", "minimal",
+                 "--no-self-update", channel],
+                check=True,
+            )
+            for target in sorted(want[channel]):
+                done = subprocess.run(
+                    ["rustup", "target", "add", "--toolchain", channel, target]
+                )
+                if done.returncode != 0:
+                    print(f"setup-pen: skipping unavailable target {target}")
+        EOF
+      shell: bash
